@@ -34,6 +34,11 @@ import { isAssetChecksumConstraint } from 'src/utils/database.js';
 import { mergeTimeZone } from 'src/utils/date.js';
 import { mimeTypes } from 'src/utils/mime-types.js';
 import { batched, isFaceImportEnabled } from 'src/utils/misc.js';
+import {
+  HONOR_MOTION_PHOTO_TRAILER_SIZE,
+  getHonorMotionPhotoRange,
+  isValidMotionPhotoVideo,
+} from 'src/utils/motion-photo.js';
 import { upsertTags } from 'src/utils/tag.js';
 import { Tasks } from 'src/utils/tasks.js';
 
@@ -667,7 +672,37 @@ export class MetadataService extends BaseService {
   }
 
   private isMotionPhoto(asset: { type: AssetType }, tags: ImmichTags): boolean {
-    return asset.type === AssetType.Image && !!(tags.MotionPhoto || tags.MicroVideo);
+    return asset.type === AssetType.Image && !!(tags.MotionPhoto || tags.MicroVideo || this.isHonorPhoto(tags));
+  }
+
+  private isHonorPhoto(tags: ImmichTags): boolean {
+    return tags.Make?.toUpperCase() === 'HONOR' && tags.MIMEType === 'image/jpeg';
+  }
+
+  private async getHonorMotionPhotoVideo(asset: Asset, stats: Stats): Promise<Buffer | undefined> {
+    if (stats.size <= HONOR_MOTION_PHOTO_TRAILER_SIZE) {
+      return;
+    }
+
+    const trailer = await this.storageRepository.readFile(asset.originalPath, {
+      buffer: Buffer.alloc(HONOR_MOTION_PHOTO_TRAILER_SIZE),
+      position: stats.size - HONOR_MOTION_PHOTO_TRAILER_SIZE,
+      length: HONOR_MOTION_PHOTO_TRAILER_SIZE,
+    });
+    const range = getHonorMotionPhotoRange(trailer, stats.size);
+    if (!range) {
+      return;
+    }
+
+    const video = await this.storageRepository.readFile(asset.originalPath, {
+      buffer: Buffer.alloc(range.length),
+      ...range,
+    });
+    if (video.length !== range.length || !isValidMotionPhotoVideo(video)) {
+      return;
+    }
+
+    return video;
   }
 
   private async applyMotionPhotos(asset: Asset, tags: ImmichTags, dates: Dates, stats: Stats) {
@@ -697,7 +732,7 @@ export class MetadataService extends BaseService {
       length = videoOffset;
     }
 
-    if (!length && !hasEmbeddedVideoFile && !hasMotionPhotoVideo) {
+    if (!length && !hasEmbeddedVideoFile && !hasMotionPhotoVideo && !this.isHonorPhoto(tags)) {
       return;
     }
 
@@ -716,12 +751,18 @@ export class MetadataService extends BaseService {
         video = await this.metadataRepository.extractBinaryTag(asset.originalPath, 'EmbeddedVideoFile');
       }
       // Default video extraction
-      else {
+      else if (length) {
         video = await this.storageRepository.readFile(asset.originalPath, {
           buffer: Buffer.alloc(length),
           position,
           length,
         });
+      } else {
+        const honorVideo = await this.getHonorMotionPhotoVideo(asset, stats);
+        if (!honorVideo) {
+          return;
+        }
+        video = honorVideo;
       }
       const checksum = this.cryptoRepository.hashSha1(video);
       const checksumQuery = { ownerId: asset.ownerId, libraryId: asset.libraryId ?? undefined, checksum };

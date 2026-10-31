@@ -956,6 +956,153 @@ describe(MetadataService.name, () => {
       });
     });
 
+    describe('Honor motion photos', () => {
+      const video = Buffer.from(
+        '00000018667479706d7034320000000069736f6d6d703432000000086d6f6f76000000086d646174',
+        'hex',
+      );
+      const trailer = Buffer.from('v2_f17'.padEnd(20) + '24:1000'.padEnd(20) + `LIVE_${video.length + 20}`.padEnd(20));
+      const file = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xd9]), video, trailer]);
+      let asset: ReturnType<typeof AssetFactory.create>;
+      let motionAsset: ReturnType<typeof AssetFactory.create>;
+      let stats: Stats;
+      let checksum: Buffer;
+
+      beforeEach(() => {
+        asset = AssetFactory.create();
+        motionAsset = AssetFactory.create({ type: AssetType.Video, visibility: AssetVisibility.Hidden });
+        checksum = randomBytes(20);
+        stats = {
+          size: file.length,
+          mtime: asset.fileModifiedAt,
+          mtimeMs: asset.fileModifiedAt.valueOf(),
+          birthtimeMs: asset.fileCreatedAt.valueOf(),
+        } as Stats;
+        mocks.assetJob.getForMetadataExtraction.mockImplementation((id) =>
+          Promise.resolve(id === asset.id ? getForMetadataExtraction(asset) : undefined),
+        );
+        mocks.storage.stat.mockResolvedValue(stats);
+        mockReadTags({
+          Make: 'HONOR',
+          Model: 'BKQ-AN00',
+          MIMEType: 'image/jpeg',
+          ContainerDirectory: [{ Item: { Semantic: 'Primary' } }, { Item: { Semantic: 'GainMap', Length: 2 } }],
+        });
+        mocks.storage.readFile.mockImplementation((_path, options) => {
+          const position = Number(options?.position ?? 0);
+          return Promise.resolve(file.subarray(position, position + Number(options?.length ?? file.length)));
+        });
+        mocks.crypto.hashSha1.mockReturnValue(checksum);
+        mocks.crypto.randomUUID.mockReturnValue(motionAsset.id);
+        mocks.asset.create.mockResolvedValue(motionAsset);
+      });
+
+      it('should extract and link the embedded video without standard XMP tags', async () => {
+        await sut.handleMetadataExtraction({ id: asset.id });
+
+        expect(mocks.crypto.hashSha1).toHaveBeenCalledWith(video);
+        expect(mocks.asset.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            id: motionAsset.id,
+            ownerId: asset.ownerId,
+            type: AssetType.Video,
+            checksum,
+            visibility: AssetVisibility.Hidden,
+            fileCreatedAt: asset.fileCreatedAt,
+          }),
+        );
+        expect(mocks.storage.createFile).toHaveBeenCalledWith(motionAsset.originalPath, video);
+        expect(mocks.asset.update).toHaveBeenCalledWith({ id: asset.id, livePhotoVideoId: motionAsset.id });
+        expect(mocks.storage.overwriteFile).not.toHaveBeenCalled();
+        expect(mocks.storage.createOrOverwriteFile).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['a normal photo', Buffer.alloc(60)],
+        [
+          'a trailer pointing outside the file',
+          Buffer.from('v2_f17'.padEnd(20) + '24:1000'.padEnd(20) + 'LIVE_99999'.padEnd(20)),
+        ],
+      ])('should leave %s without a linked motion video', async (_name, invalidTrailer) => {
+        mocks.storage.readFile.mockResolvedValueOnce(invalidTrailer);
+
+        await sut.handleMetadataExtraction({ id: asset.id });
+
+        expect(mocks.storage.readFile).toHaveBeenCalledTimes(1);
+        expect(mocks.crypto.hashSha1).not.toHaveBeenCalled();
+        expect(mocks.asset.create).not.toHaveBeenCalled();
+        expect(mocks.storage.createFile).not.toHaveBeenCalled();
+      });
+
+      it('should reject invalid embedded MP4 data before creating a motion asset', async () => {
+        mocks.storage.readFile.mockResolvedValueOnce(trailer).mockResolvedValueOnce(Buffer.alloc(video.length));
+
+        await sut.handleMetadataExtraction({ id: asset.id });
+
+        expect(mocks.crypto.hashSha1).not.toHaveBeenCalled();
+        expect(mocks.asset.create).not.toHaveBeenCalled();
+        expect(mocks.storage.createFile).not.toHaveBeenCalled();
+      });
+
+      it('should not read a trailer from an undersized file', async () => {
+        mocks.storage.stat.mockResolvedValue({ ...stats, size: 59 });
+
+        await sut.handleMetadataExtraction({ id: asset.id });
+
+        expect(mocks.storage.readFile).not.toHaveBeenCalled();
+        expect(mocks.asset.create).not.toHaveBeenCalled();
+      });
+
+      it('should reuse an already linked video when metadata is extracted again', async () => {
+        asset.livePhotoVideoId = motionAsset.id;
+        mocks.asset.getByChecksum.mockResolvedValue(motionAsset);
+        mocks.storage.checkFileExists.mockResolvedValue(true);
+
+        await sut.handleMetadataExtraction({ id: asset.id });
+
+        expect(mocks.asset.getByChecksum).toHaveBeenCalledWith({ ownerId: asset.ownerId, checksum });
+        expect(mocks.asset.create).not.toHaveBeenCalled();
+        expect(mocks.storage.createFile).not.toHaveBeenCalled();
+        expect(mocks.user.updateUsage).not.toHaveBeenCalled();
+        expect(mocks.job.queue).not.toHaveBeenCalled();
+      });
+
+      it('should preserve the standard XMP extraction path when its tags are present', async () => {
+        mockReadTags({ Make: 'HONOR', MIMEType: 'image/jpeg', MicroVideo: 1, MicroVideoOffset: video.length });
+        mocks.storage.readFile.mockResolvedValue(video);
+
+        await sut.handleMetadataExtraction({ id: asset.id });
+
+        expect(mocks.storage.readFile).toHaveBeenCalledExactlyOnceWith(asset.originalPath, {
+          buffer: Buffer.alloc(video.length),
+          position: file.length - video.length,
+          length: video.length,
+        });
+        expect(mocks.crypto.hashSha1).toHaveBeenCalledWith(video);
+      });
+
+      it('should contain trailer read failures without failing the metadata job', async () => {
+        mocks.storage.readFile.mockRejectedValueOnce(new Error('Unable to read trailer'));
+
+        await expect(sut.handleMetadataExtraction({ id: asset.id })).resolves.toBeUndefined();
+
+        expect(mocks.logger.error).toHaveBeenCalled();
+        expect(mocks.asset.create).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        { Make: 'HONOR', MIMEType: 'image/heic' },
+        { Make: 'Other', MIMEType: 'image/jpeg' },
+      ])('should not inspect a trailer for $Make $MIMEType', async (tags) => {
+        mockReadTags(tags);
+
+        await sut.handleMetadataExtraction({ id: asset.id });
+
+        expect(mocks.storage.readFile).not.toHaveBeenCalled();
+        expect(mocks.asset.create).not.toHaveBeenCalled();
+      });
+    });
+
     it.each([
       {
         motion: 'an extracted motion video',
